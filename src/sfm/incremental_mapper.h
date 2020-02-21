@@ -128,9 +128,19 @@ class IncrementalMapper {
       MAX_VISIBLE_POINTS_RATIO,
       MIN_UNCERTAINTY,
     };
+
     ImageSelectionMethod image_selection_method =
         ImageSelectionMethod::MIN_UNCERTAINTY;
 
+    //Options passed for Visual Semantic Localization. Extension by Chetan. 
+    std::string db_image_folder; 
+    std::string db_netvlad_folder; 
+    std::string db_semantic_folder;
+    std::string semantic_scripts_folder;
+    std::string query_semantic_folder; 
+    std::string query_netvlad_folder;
+    std::string outputs_folder; 
+    
     bool Check() const;
   };
 
@@ -166,6 +176,10 @@ class IncrementalMapper {
   // ignores images that failed to registered for `max_reg_trials`.
   std::vector<image_t> FindNextImages(const Options& options);
 
+  //query closest NetVLAD indices with the necessary script. 
+  std::vector<int> PerformNetVLADQuery(const std::string query_image_name, const Options &options);
+
+
   // Attempt to seed the reconstruction from an image pair.
   bool RegisterInitialImagePair(const Options& options, const image_t image_id1,
                                 const image_t image_id2);
@@ -173,6 +187,17 @@ class IncrementalMapper {
   // Attempt to register image to the existing model. This requires that
   // a previous call to `RegisterInitialImagePair` was successful.
   bool RegisterNextImage(const Options& options, const image_t image_id);
+
+    // Attempt to register image to the existing model. We attempt to use the semantics of 
+    //database images to assign semantic labels to 3D maps, calculate semantic scores between query and 
+    //database images, and use these scores to get refine our pose estimate. 
+    //This requires that a previous call to `RegisterInitialImagePair` was successful.
+  bool RegisterNextImageSemantically(const Options& options, const Database &database, const image_t image_id);
+
+  bool checkShiVisibility(const image_t image_id, const Point3D pt);
+
+  //Get temporary pose of the objects by utilizing precomputed NetVLAD descriptors for every image.
+  std::map<int, FeatureMatches> RegisterNextImageNetVLAD(const Options &options, const Database &database, const image_t image_id);
 
   // Triangulate observations of image.
   size_t TriangulateImage(const IncrementalTriangulator::Options& tri_options,

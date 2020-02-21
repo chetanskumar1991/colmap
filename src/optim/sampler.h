@@ -34,6 +34,13 @@
 
 #include <cstddef>
 #include <vector>
+#include <iostream>
+#include <iterator>
+#include <boost/random/uniform_01.hpp>
+#include <boost/random/mersenne_twister.hpp>
+#include <algorithm>
+
+using namespace boost::random;
 
 #include "util/logging.h"
 
@@ -67,6 +74,10 @@ class Sampler {
   // should equal `num_samples`. The same applies for `Y` and `Y_rand`.
   template <typename X_t, typename Y_t>
   void SampleXY(const X_t& X, const Y_t& Y, X_t* X_rand, Y_t* Y_rand);
+
+  
+  template <typename X_t, typename Y_t>
+  void SampleXY_Weighted(const X_t& X, const Y_t& Y, X_t* X_rand, Y_t* Y_rand, std::vector<float> sample_weights);
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -87,6 +98,50 @@ void Sampler::SampleXY(const X_t& X, const Y_t& Y, X_t* X_rand, Y_t* Y_rand) {
   CHECK_EQ(X_rand->size(), Y_rand->size());
   const auto sample_idxs = Sample();
   for (size_t i = 0; i < X_rand->size(); ++i) {
+    (*X_rand)[i] = X[sample_idxs[i]];
+    (*Y_rand)[i] = Y[sample_idxs[i]];
+  }
+}
+
+template <typename X_t, typename Y_t>
+void Sampler::SampleXY_Weighted(const X_t& X, const Y_t& Y, X_t* X_rand, Y_t* Y_rand, std::vector<float> sample_weights) 
+{
+  CHECK_EQ(X.size(), Y.size());
+  CHECK_EQ(X.size(), sample_weights.size());
+  CHECK_EQ(X_rand->size(), Y_rand->size());
+
+  uniform_01<> dist;
+  boost::random::mt19937 gen(342575235);
+  std::vector<double> vals;
+  
+  //---------------------------------------
+  //Sample Indices according to distribution. 
+  //---------------------------------------
+  for (auto iter : sample_weights) 
+  {
+    vals.push_back(std::pow(dist(gen), 1. / iter));
+  }
+
+  // Sorting vals, but retain the indices. 
+  // There is unfortunately no easy way to do this with STL.
+  std::vector<std::pair<int, double>> valsWithIndices;
+  for (size_t iter = 0; iter < vals.size(); iter++) 
+  {
+    valsWithIndices.emplace_back(iter, vals[iter]);
+  }
+  
+  std::sort(valsWithIndices.begin(), valsWithIndices.end(), [](auto x, auto y) {return x.second > y.second; });
+  
+  std::vector<int> sample_idxs;
+  int sampleSize = X_rand->size();
+  for (auto iter = 0; iter < sampleSize; iter++) 
+  {
+        sample_idxs.push_back(valsWithIndices[iter].first);
+  }
+
+  //Apply indices to get our random sampling. 
+  for (size_t i = 0; i < X_rand->size(); ++i) 
+  {
     (*X_rand)[i] = X[sample_idxs[i]];
     (*Y_rand)[i] = Y[sample_idxs[i]];
   }

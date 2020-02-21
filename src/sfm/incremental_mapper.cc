@@ -33,12 +33,15 @@
 
 #include <array>
 #include <fstream>
-
+#include <Python.h>
 #include "base/projection.h"
 #include "base/triangulation.h"
 #include "estimators/pose.h"
 #include "util/bitmap.h"
 #include "util/misc.h"
+#include "SiftGPU/SiftGPU.h"
+#include "feature/sift.h"
+#include "feature/utils.h"
 
 namespace colmap {
 namespace {
@@ -501,6 +504,530 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
 
   if (!RefineAbsolutePose(abs_pose_refinement_options, inlier_mask,
                           tri_points2D, tri_points3D, &image.Qvec(),
+                          &image.Tvec(), &camera)) {
+    return false;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Continue tracks
+  //////////////////////////////////////////////////////////////////////////////
+
+  reconstruction_->RegisterImage(image_id);
+  RegisterImageEvent(image_id);
+
+  for (size_t i = 0; i < inlier_mask.size(); ++i) {
+    if (inlier_mask[i]) {
+      const point2D_t point2D_idx = tri_corrs[i].first;
+      const Point2D& point2D = image.Point2D(point2D_idx);
+      if (!point2D.HasPoint3D()) {
+        const point3D_t point3D_id = tri_corrs[i].second;
+        const TrackElement track_el(image_id, point2D_idx);
+        reconstruction_->AddObservation(point3D_id, track_el);
+        triangulator_->AddModifiedPoint3D(point3D_id);
+      }
+    }
+  }
+
+  return true;
+}
+
+std::vector<int> IncrementalMapper::PerformNetVLADQuery(const std::string query_image_name, const Options& options)
+{
+    std::string query_image_netvl_path = options.query_netvlad_folder + "/" + query_image_name; 
+    std::string netvl_folder_path = options.db_netvlad_folder; 
+
+    PyObject *pName, *pModule, *pFunc;
+    PyObject *pArgs, *pValue;
+    int i;
+
+    Py_Initialize();
+    pName = PyUnicode_FromString("vlad_query"); //vlad_query is the name of the netvlad script we shall use. 
+
+    pModule = PyImport_Import(pName);
+    Py_DECREF(pName);
+    std::vector<std::string> argv; 
+    argv.push_back(query_image_netvl_path); 
+    argv.push_back(netvl_folder_path); 
+
+    if (pModule != NULL) {
+        pFunc = PyObject_GetAttrString(pModule, "perform_netvlad_query");
+        /* pFunc is a new reference */
+
+        if (pFunc && PyCallable_Check(pFunc)) {
+            pArgs = PyTuple_New(2);
+            for (i = 0; i < 2; ++i) {
+                pValue = PyUnicode_FromString(argv[i].c_str());
+                if (!pValue) {
+                    Py_DECREF(pArgs);
+                    Py_DECREF(pModule);
+                    fprintf(stderr, "Cannot convert argument\n");
+                }
+                /* pValue reference stolen here: */
+                PyTuple_SetItem(pArgs, i, pValue);
+            }
+            pValue = PyObject_CallObject(pFunc, pArgs);
+            Py_DECREF(pArgs);
+            if (pValue != NULL) {
+                printf("Result of call: %ld\n", PyLong_AsLong(pValue));
+                Py_DECREF(pValue);
+            }
+            else {
+                Py_DECREF(pFunc);
+                Py_DECREF(pModule);
+                PyErr_Print();
+                fprintf(stderr,"Call failed\n");
+            }
+        }
+        else {
+            if (PyErr_Occurred())
+                PyErr_Print();
+            fprintf(stderr, "Cannot find function");// \"%s\"\n", argv[2]);
+        }
+        Py_XDECREF(pFunc);
+        Py_DECREF(pModule);
+    }
+    
+    else 
+    {
+        PyErr_Print();
+        fprintf(stderr, "Failed to load");// \"%s\"\n", argv[1]);
+    }
+
+    Py_Finalize(); 
+
+    //TODO: make sure the image id's of FLANN correspond to image_id of COLMAP database.
+    std::vector<int> opvec; 
+
+    std::string output_file_path = options.outputs_folder + "netvl_query_res.txt";
+    std::ifstream opfile (output_file_path);
+    if (opfile.is_open())
+    {
+      std::string line;
+      while ( getline (opfile,line) )
+      {
+        int idx = std::stoi(line);
+        opvec.push_back(idx);
+      }
+
+      opfile.close();
+    }
+
+    return opvec; 
+}
+
+std::map<int, FeatureMatches> IncrementalMapper::RegisterNextImageNetVLAD(const Options &options, const Database &database, const image_t image_id)
+{
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_GE(reconstruction_->NumRegImages(), 2);
+
+  CHECK(options.Check());
+
+  Image& query_image = reconstruction_->Image(image_id);
+  Camera& camera = reconstruction_->Camera(query_image.CameraId());
+
+  CHECK(!query_image.IsRegistered()) << "Image cannot be registered multiple times";
+
+  //Call python script that returns top-k netvlad images. 
+  std::vector<int> result_vec = PerformNetVLADQuery(query_image.Name(), options); 
+  
+  //Extract descriptors for query image. 
+  FeatureKeypoints keypoints_query_im = database.ReadKeypoints(image_id);
+  FeatureDescriptors descriptors_query_im = database.ReadDescriptors(image_id);
+
+  //Get 2d-3d correspondences from netvlad candidates. 
+  std::map<int, FeatureMatches> match_map; 
+  for(int i = 0; i < result_vec.size(); i++)
+  {
+    int cand_id = result_vec[i];
+    Image &cand_image = reconstruction_->Image(cand_id);
+
+    //Perform 2d-2d matching with query image with relaxed lowe-ratio. 
+    FeatureKeypoints keypoints_cand_im = database.ReadKeypoints(cand_id);
+    FeatureDescriptors descriptors_cand_im = database.ReadDescriptors(cand_id);
+    FeatureMatches matches_query_cand; 
+    MatchSiftFeaturesCPUFLANN(SiftMatchingOptions(), descriptors_query_im, descriptors_cand_im, &matches_query_cand);
+
+    match_map.insert(std::pair<int, FeatureMatches>(cand_id, matches_query_cand));
+  }
+  
+  return match_map;
+}
+bool IncrementalMapper::checkShiVisibility(const image_t image_id, const Point3D pt3d)
+{
+  ////////////////////////////////////////////////////////////////////////////
+  //We need the following to check for visibility:  
+  //dl - min distance from candidate db cameras.
+  //du - max distance from candidate db cameras.
+  //theta - angle between extremal viewing directions of this 3d Point. 
+  //v - distance between 3d point and center of projection of query point. 
+  //vm - vector lying between extremal viewing directions. 
+  ////////////////////////////////////////////////////////////////////////////
+
+  Eigen::Vector3d vm;
+  float dl = 999999;
+  float du = 0;
+  float theta_min = 99999;
+  float theta_max = 0; 
+  
+  Track tr = pt3d.Track();
+  const Image &image = reconstruction_->Image(image_id);
+  Eigen::Vector3d v = image.ProjectionCenter() - pt3d.XYZ();
+  Eigen::Vector3d vl, vu; 
+  for(const auto trackElem : tr.Elements())
+  {
+    int image_id = trackElem.image_id;
+    const Image &image = reconstruction_->Image(image_id);
+    
+    Eigen::Vector3d v = image.ProjectionCenter() - pt3d.XYZ();
+    if(dl > v.norm())
+    {
+      dl = v.norm();
+    }
+
+    if(du < v.norm())
+    {
+      du = v.norm(); 
+    }
+
+    //Calculate the angle made by this v with the origin, and use this to calculate extremal angles and Vm. 
+    float angle = acos(v.transpose() * (-1.0 * pt3d.XYZ()));
+    if(theta_max < angle)
+    {
+       theta_max = angle; 
+       vu = v;
+    }
+
+    if(theta_min >= angle)
+    {
+      theta_min = angle; 
+      vl = v; 
+    }
+  }
+  
+  vm = (vl + vu) / 2.0; 
+  float theta = theta_max - theta_min;
+  float angle = acos(v.transpose() * vm);
+  if(angle < theta)
+  {
+    if((dl <= v.norm()) && (v.norm() < du))
+    return true;
+  }
+
+  return false; 
+}
+
+bool IncrementalMapper::RegisterNextImageSemantically(const Options& options, const Database &database, const image_t image_id)
+{ 
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_GE(reconstruction_->NumRegImages(), 2);
+
+  CHECK(options.Check());
+
+  Image& image = reconstruction_->Image(image_id);
+  Camera& camera = reconstruction_->Camera(image.CameraId());
+
+  CHECK(!image.IsRegistered()) << "Image cannot be registered multiple times";
+
+  num_reg_trials_[image_id] += 1;
+
+  // Check if enough 2D-3D correspondences.
+  if (image.NumVisiblePoints3D() <
+      static_cast<size_t>(options.abs_pose_min_num_inliers)) {
+    return false;
+  }
+
+  //Use NetVLAD to get the top k candidates, and compute temporary pose from there. 
+  std::map<int, FeatureMatches>  cand_match_map = RegisterNextImageNetVLAD(options, database, image_id);
+  std::map<int, std::vector<std::pair<Point2D, Point3D>>> imageCorrMap; 
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Search for 2D-3D correspondences
+  //////////////////////////////////////////////////////////////////////////////
+  const int kCorrTransitivity = 1;
+  std::vector<std::pair<point2D_t, point3D_t>> tri_corrs;
+  std::vector<Eigen::Vector2d> tri_points2D;
+  std::vector<Eigen::Vector3d> tri_points3D;
+  std::vector<int> point3D_ids;
+  std::map<int, int> perImageSemanticScore; 
+  std::vector<int> imageIdVec; 
+
+  for(auto const &m : cand_match_map)
+  {
+    int cand_id = m.first;
+    Image &cand_image = reconstruction_->Image(cand_id);
+
+    FeatureMatches cand_fm = m.second; 
+    std::vector<std::pair<Point2D, Point3D>> corr_vec; 
+  
+    //Get 2d - 3d correspondences and put in vec. 
+    for(int i = 0; i < cand_fm.size(); i++)
+    {
+      int querypt_idx = cand_fm[i].point2D_idx1;
+      int candpt_idx = cand_fm[i].point2D_idx2;
+      
+      const Point2D& query_point2D = image.Point2D(querypt_idx);
+      const Point2D& corr_point2D = cand_image.Point2D(candpt_idx);
+      if (!corr_point2D.HasPoint3D()) 
+      {
+        continue;
+      }
+
+      // Avoid duplicate correspondences.
+      if (std::count(point3D_ids.begin(), point3D_ids.end(), corr_point2D.Point3DId()) > 0) 
+      {
+        continue;
+      }
+
+      const Camera& corr_camera = reconstruction_->Camera(cand_image.CameraId());
+
+      // Avoid correspondences to images with bogus camera parameters.
+      if (corr_camera.HasBogusParams(options.min_focal_length_ratio,
+                                     options.max_focal_length_ratio,
+                                     options.max_extra_param)) 
+      {
+        continue;
+      }
+
+      const Point3D& point3D = reconstruction_->Point3D(corr_point2D.Point3DId());
+      corr_vec.push_back(std::pair<Point2D, Point3D>(corr_point2D, point3D));
+      
+      point3D_ids.push_back(corr_point2D.Point3DId());
+      tri_corrs.emplace_back(querypt_idx, corr_point2D.Point3DId());
+      tri_points2D.push_back(query_point2D.XY());
+      tri_points3D.push_back(point3D.XYZ());
+    }
+    
+    imageCorrMap.insert(std::pair<int, std::vector<std::pair<Point2D, Point3D>>>(cand_id, corr_vec));
+  }
+  
+  ///////////////////////////////////////////////////
+  //Get temporary pose. 
+  ///////////////////////////////////////////////////
+  AbsolutePoseEstimationOptions abs_pose_options;
+  
+  //Add semantic info!
+  abs_pose_options.num_threads = options.num_threads;
+  abs_pose_options.num_focal_length_samples = 30;
+  abs_pose_options.min_focal_length_ratio = options.min_focal_length_ratio;
+  abs_pose_options.max_focal_length_ratio = options.max_focal_length_ratio;
+  abs_pose_options.ransac_options.max_error = options.abs_pose_max_error;
+  abs_pose_options.ransac_options.min_inlier_ratio =
+      options.abs_pose_min_inlier_ratio;
+
+  // Use high confidence to avoid preemptive termination of P3P RANSAC
+  // - too early termination may lead to bad registration.
+  abs_pose_options.ransac_options.min_num_trials = 100;
+  abs_pose_options.ransac_options.max_num_trials = 10000;
+  abs_pose_options.ransac_options.confidence = 0.99999;
+
+  AbsolutePoseRefinementOptions abs_pose_refinement_options;
+  if (num_reg_images_per_camera_[image.CameraId()] > 0) {
+    // Camera already refined from another image with the same camera.
+    if (camera.HasBogusParams(options.min_focal_length_ratio,
+                              options.max_focal_length_ratio,
+                              options.max_extra_param)) {
+      // Previously refined camera has bogus parameters,
+      // so reset parameters and try to re-refine.
+      camera.SetParams(database_cache_->Camera(image.CameraId()).Params());
+      abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+      abs_pose_refinement_options.refine_focal_length = true;
+      abs_pose_refinement_options.refine_extra_params = true;
+    } else {
+      abs_pose_options.estimate_focal_length = false;
+      abs_pose_refinement_options.refine_focal_length = false;
+      abs_pose_refinement_options.refine_extra_params = false;
+    }
+  } else {
+    // Camera not refined before.
+    abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+    abs_pose_refinement_options.refine_focal_length = true;
+    abs_pose_refinement_options.refine_extra_params = true;
+  }
+
+  if (!options.abs_pose_refine_focal_length) {
+    abs_pose_options.estimate_focal_length = false;
+    abs_pose_refinement_options.refine_focal_length = false;
+  }
+
+  if (!options.abs_pose_refine_extra_params) {
+    abs_pose_refinement_options.refine_extra_params = false;
+  }
+
+  size_t num_inliers;
+  std::vector<char> inlier_mask;
+
+  if (!EstimateAbsolutePose(abs_pose_options, tri_points2D, tri_points3D,
+                            &image.Qvec(), &image.Tvec(), &camera, &num_inliers,
+                            &inlier_mask)) {
+    return false;
+  }
+
+  if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
+    return false;
+  }
+
+  if (!RefineAbsolutePose(abs_pose_refinement_options, inlier_mask,
+                          tri_points2D, tri_points3D, &image.Qvec(),
+                          &image.Tvec(), &camera)) {
+    return false;
+  }
+   
+  ////////////////////////////////////////////////////////
+  //Use temporary pose for refining with semantic labels. 
+  ////////////////////////////////////////////////////////
+  //Get labels for all the 3d points by making all the visible cameras vote on it. 
+  std::map<int, int> point3dToSemLabel;
+  for(auto pt3didx : point3D_ids)
+  {
+    Point3D pt3d = reconstruction_->Point3D(pt3didx);
+    std::vector<int> voteVec(100, 0);
+    
+    Track tr = pt3d.Track();
+    for(const auto trackElem : tr.Elements())
+    {
+      Image &img = reconstruction_->Image(trackElem.image_id);
+      Point2D pt2d = img.Point2D(trackElem.point2D_idx); 
+
+      assert(std::find(m_file_list.begin(), m_file_list.end(), img.Name()) != m_file_list.end()); 
+
+      std::string filepath = options.db_semantic_folder + "/" + img.Name(); 
+      
+      Bitmap bitmap; 
+      bitmap.Read(filepath, false);
+
+      BitmapColor<uint8_t> *color;
+      bitmap.GetPixel(pt2d.X(), pt2d.Y(), color);
+
+      uint8_t semLabel = color->r; 
+      voteVec[semLabel]++; 
+    }
+    
+    int pt3dSemLabel = std::max_element(voteVec.begin(), voteVec.end()) - voteVec.begin();
+    point3dToSemLabel.insert(std::pair<int, int>(pt3didx, pt3dSemLabel));  
+  }
+  
+  //Project 3d point onto query image, and update image's semantic score. 
+  std::map<int, int> imageToSemScore;
+  int totalSemScore = 0;
+  std::string filepath = options.query_semantic_folder + "/" + image.Name(); 
+  Bitmap bitmap; 
+  bitmap.Read(filepath, false);
+  BitmapColor<uint8_t> *color;
+  
+  std::vector<Eigen::Vector2d> refined_tri_points2D;
+  std::vector<Eigen::Vector3d> refined_tri_points3D;
+  for(auto const &elem : imageCorrMap)
+  {   
+    for(auto const &corr : elem.second)
+    {
+      Eigen::Vector3d ptvec = corr.second.XYZ();   
+
+      //TODO: project only those 3d points that satisfy the visibility conditions, as in Shi et.al.
+      bool visible = checkShiVisibility(elem.first, corr.second);
+      if(!visible)
+      {        
+        continue; 
+      }
+
+      refined_tri_points2D.push_back(corr.first.XY()); 
+      refined_tri_points3D.push_back(corr.second.XYZ());
+
+      Eigen::Vector2d pt2d = ProjectPointToImage(ptvec, image.ProjectionMatrix(), camera);
+      bitmap.GetPixel(pt2d[0], pt2d[1], color);
+
+      imageIdVec.push_back(elem.first); //To know which image point is associated with.  
+
+      //Assume we get semantic labels in the images. 
+      int imLabel = color->r; 
+      if(imLabel == point3dToSemLabel[corr.first.Point3DId()])
+      {
+        if(imageToSemScore.count(elem.first) == 0)
+        imageToSemScore.insert(std::pair<int, int>(elem.first, 0));
+
+        else 
+        {
+          imageToSemScore[elem.first]++;
+          totalSemScore++;
+        }
+      }
+    }
+  }
+
+  //Create per sample weights, normalizing wrt its source image's semantic score. 
+  std::vector<float> sampleWeightsVec; 
+  for(int i = 0; i < imageIdVec.size(); i++)
+  {
+    sampleWeightsVec.push_back(imageToSemScore[image_id]); //TODO: check if normalization is actually necessary with the sampler. 
+  }
+
+  //----------------------------------------
+  //With the 2D-3D matches, perform the weighted RANSAC procedure. 
+  //----------------------------------------  
+  //Add semantic info!
+  abs_pose_options.ransac_options.semantic = true; 
+  abs_pose_options.ransac_options.sampleWeights = sampleWeightsVec; 
+
+  abs_pose_options.num_threads = options.num_threads;
+  abs_pose_options.num_focal_length_samples = 30;
+  abs_pose_options.min_focal_length_ratio = options.min_focal_length_ratio;
+  abs_pose_options.max_focal_length_ratio = options.max_focal_length_ratio;
+  abs_pose_options.ransac_options.max_error = options.abs_pose_max_error;
+  abs_pose_options.ransac_options.min_inlier_ratio =
+      options.abs_pose_min_inlier_ratio;
+  // Use high confidence to avoid preemptive termination of P3P RANSAC
+  // - too early termination may lead to bad registration.
+  abs_pose_options.ransac_options.min_num_trials = 100;
+  abs_pose_options.ransac_options.max_num_trials = 10000;
+  abs_pose_options.ransac_options.confidence = 0.99999;
+
+  if (num_reg_images_per_camera_[image.CameraId()] > 0) {
+    // Camera already refined from another image with the same camera.
+    if (camera.HasBogusParams(options.min_focal_length_ratio,
+                              options.max_focal_length_ratio,
+                              options.max_extra_param)) {
+      // Previously refined camera has bogus parameters,
+      // so reset parameters and try to re-refine.
+      camera.SetParams(database_cache_->Camera(image.CameraId()).Params());
+      abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+      abs_pose_refinement_options.refine_focal_length = true;
+      abs_pose_refinement_options.refine_extra_params = true;
+    } else {
+      abs_pose_options.estimate_focal_length = false;
+      abs_pose_refinement_options.refine_focal_length = false;
+      abs_pose_refinement_options.refine_extra_params = false;
+    }
+  } else {
+    // Camera not refined before.
+    abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+    abs_pose_refinement_options.refine_focal_length = true;
+    abs_pose_refinement_options.refine_extra_params = true;
+  }
+
+  if (!options.abs_pose_refine_focal_length) {
+    abs_pose_options.estimate_focal_length = false;
+    abs_pose_refinement_options.refine_focal_length = false;
+  }
+
+  if (!options.abs_pose_refine_extra_params) {
+    abs_pose_refinement_options.refine_extra_params = false;
+  }
+
+  if (!EstimateAbsolutePose(abs_pose_options, refined_tri_points2D, refined_tri_points3D,
+                            &image.Qvec(), &image.Tvec(), &camera, &num_inliers,
+                            &inlier_mask)) {
+    return false;
+  }
+
+  if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
+    return false;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Pose refinement
+  //////////////////////////////////////////////////////////////////////////////
+
+  if (!RefineAbsolutePose(abs_pose_refinement_options, inlier_mask,
+                          refined_tri_points2D, refined_tri_points3D, &image.Qvec(),
                           &image.Tvec(), &camera)) {
     return false;
   }

@@ -104,6 +104,11 @@ find_package(OpenGL REQUIRED)
 find_package(Glew REQUIRED)
 find_package(Git)
 
+find_package(PythonLibs 3)
+
+set(PYTHON_INCLUDE_DIR "$ENV{HOME}/anaconda3/include/python3.7m")
+set(PYTHON_LIBRARY "$ENV{HOME}/anaconda3/lib/libpython3.7m.so")
+
 if(CGAL_ENABLED)
     set(CGAL_DO_NOT_WARN_ABOUT_CMAKE_BUILD_TYPE TRUE)
     find_package(CGAL QUIET)
@@ -268,6 +273,7 @@ set(COLMAP_INCLUDE_DIRS
     ${Qt5Core_INCLUDE_DIRS}
     ${Qt5OpenGL_INCLUDE_DIRS}
     ${Qt5Widgets_INCLUDE_DIRS}
+    ${PYTHON_INCLUDE_DIRS}
 )
 
 set(COLMAP_LINK_DIRS
@@ -288,6 +294,7 @@ set(COLMAP_EXTERNAL_LIBRARIES
     ${Qt5Core_LIBRARIES}
     ${Qt5OpenGL_LIBRARIES}
     ${Qt5Widgets_LIBRARIES}
+    ${PYTHON_LIBRARIES}
 )
 
 if(OPENMP_FOUND)

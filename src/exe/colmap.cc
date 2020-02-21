@@ -774,9 +774,10 @@ int RunImageRegistrator(int argc, char** argv) {
   PrintHeading1("Loading database");
 
   DatabaseCache database_cache;
+  Database database(*options.database_path);
 
   {
-    Database database(*options.database_path);
+    // Database database(*options.database_path);
     Timer timer;
     timer.Start();
     const size_t min_num_matches =
@@ -797,7 +798,6 @@ int RunImageRegistrator(int argc, char** argv) {
   mapper.BeginReconstruction(&reconstruction);
 
   const auto mapper_options = options.mapper->Mapper();
-
   for (const auto& image : reconstruction.Images()) {
     if (image.second.IsRegistered()) {
       continue;
@@ -810,7 +810,8 @@ int RunImageRegistrator(int argc, char** argv) {
               << " / " << image.second.NumObservations() << " points"
               << std::endl;
 
-    mapper.RegisterNextImage(mapper_options, image.first);
+    // mapper.RegisterNextImage(mapper_options, image.first);
+    mapper.RegisterNextImageSemantically(mapper_options, database, image.first);
   }
 
   const bool kDiscardReconstruction = false;
